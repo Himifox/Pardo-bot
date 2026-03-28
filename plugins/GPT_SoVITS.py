@@ -15,24 +15,32 @@ from openai import AsyncOpenAI
 from plugins.memory import get_history_str, save_bot_reply
 from .import Sticker_sender
 from plugins.Sticker_recognize import smart_send
+from plugins.config import *
 
 # logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+# ===========================================
+# 
+# ===========================================
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+def to_api_path(rel_path: str) -> str:
+    """解决 API 找不到文件的核心：转为绝对路径且强制使用正斜杠"""
+    abs_path = os.path.join(BASE_DIR, rel_path)
+    return abs_path.replace("\\", "/")
 
 # ================= 配置区域 =================
 SOVITS_API_URL = "http://127.0.0.1:9880/tts"
-REFER_WAV_PATH = "ref_audio/罐头，你怎么才回来……嗯？找到了个开店的好地方？在哪在哪？.wav"  # 建议换成帕朵的参考音频
+REFER_WAV_PATH = to_api_path("ref_audio/罐头.wav")  # 建议换成帕朵的参考音频
 PROMPT_TEXT = "罐头，你怎么才回来……嗯？找到了个开店的好地方？在哪在哪？"  # 对应参考音频的文字
 AUX_PATH_1 = "ref_audio/罐头，你怎么才回来……嗯？找到了个开店的好地方？在哪在哪？.wav"
 AUX_PATH_2 = "ref_audio/喵喵喵 喵喵喵 喵喵喵.wav"
 aux_ref_audio_paths = [AUX_PATH_1, AUX_PATH_2]
 PROMPT_LANG = "zh"
-
 # 参考音频目录与关键词映射（可在此手动添加显式映射）
 REF_AUDIO_DIR = "ref_audio"
 REF_KEYWORD_MAP: Dict[str, str] = {}
-
 # 缓存配置：避免每次请求都扫描目录
 REF_MAP_CACHE: Optional[Dict[str, str]] = None
 REF_MAP_CACHE_TIME: float = 0
@@ -49,8 +57,8 @@ TARGET_UID = "u_MkWCKLdJG7Jubt9cQXbSpg"  # 语料学习目标 UID
 ACTIVATE_COMMAND = "#Neko"  # 激活指令
 WHITE_LIST_FILE = "active_groups.json"
 
-TEXT_PROBABILITY = 0.7
-VOICE_PROBABILITY = 0.3
+TEXT_PROBABILITY = 0.9
+VOICE_PROBABILITY = 0.5
 GLOBAL_CD = 30  # 全局冷却时间，单位秒
 VOICE_KEYWORDS = [ "语音", "声音", "唱歌", "听听", "想你了帕朵"]
 TXT_KEYWORDS = ["帕朵"]
@@ -171,108 +179,66 @@ def load_target_history(filepath: str, target_uid: str) -> List[str]:
         logger.exception("load_target_history failed")
         return []
 
-
-#def load_ref_keyword_map() -> Dict[str, str]:
+# Call this function at the start of the script to ensure the directory and file exist
+def ensure_ref_audio_exists():
     """
-        暂时未使用的函数，预留给未来可能的功能扩展。
-         - 作用：扫描 `ref_audio` 目录，构建关键词到音频
+    Ensure the ref_audio directory and required files exist.
     """
-    """扫描 `ref_audio` 目录并返回 filename(或拆分的部分) -> 绝对路径 映射（带缓存）。
-    global REF_MAP_CACHE, REF_MAP_CACHE_TIME
-    now = time.time()
-    try:
-        if REF_MAP_CACHE is not None and (now - REF_MAP_CACHE_TIME) < REF_MAP_TTL:
-            logger.debug("Using cached ref map (age=%.1fs)", now - REF_MAP_CACHE_TIME)
-            return REF_MAP_CACHE
-    except Exception:
-        logger.exception("ref map cache check failed")
+    if not os.path.exists(REF_AUDIO_DIR):
+        os.makedirs(REF_AUDIO_DIR)
+        logger.info(f"Created missing directory: {REF_AUDIO_DIR}")
 
-    mapping = dict(REF_KEYWORD_MAP)
-    try:
-        if os.path.isdir(REF_AUDIO_DIR):
-            for fn in os.listdir(REF_AUDIO_DIR):
-                fp = os.path.join(REF_AUDIO_DIR, fn)
-                if not os.path.isfile(fp):
-                    continue
-                name, _ = os.path.splitext(fn)
-                parts = re.split(r'[,，\s_\-]+', name)
-                for p in parts:
-                    k = p.strip()
-                    if not k:
-                        continue
-                    if k not in mapping:
-                        mapping[k] = fp
-    except Exception:
-        pass
+    if not os.path.exists(REFER_WAV_PATH):
+        with open(REFER_WAV_PATH, "wb") as f:
+            f.write(b"")  # Create an empty file as a placeholder
+        logger.warning(f"Created missing reference audio file: {REFER_WAV_PATH}")
 
-    try:
-        REF_MAP_CACHE = mapping
-        REF_MAP_CACHE_TIME = now
-        logger.debug("Ref map cache updated (%d entries)", len(mapping))
-    except Exception:
-        logger.exception("failed to set ref map cache")
+# Ensure auxiliary reference audio files exist
+valid_aux_ref_audio_paths = []
+for aux_path in aux_ref_audio_paths:
+    if os.path.exists(aux_path):
+        valid_aux_ref_audio_paths.append(aux_path)
+    else:
+        logger.warning(f"Audio file does not exist, skipping: {aux_path}")
 
-    return mapping
-
-
-def clear_ref_map_cache():
-    # 清除 ref 映射缓存（用于调试）。
-    global REF_MAP_CACHE, REF_MAP_CACHE_TIME
-    REF_MAP_CACHE = None
-    REF_MAP_CACHE_TIME = 0
-
-
-def choose_ref_audio(text: str) -> str:
-    # 根据文本匹配关键词，返回匹配到的音频路径；未匹配返回默认 `REFER_WAV_PATH`
-    mapping = load_ref_keyword_map()
-    for kw, path in mapping.items():
-        try:
-            if kw and kw in text:
-                logger.debug("Matched ref keyword '%s' -> %s", kw, path)
-                return path
-        except Exception:
-            logger.exception("error checking keyword %s", kw)
-            continue
-    logger.debug("No ref keyword matched; using default %s", REFER_WAV_PATH)
-    return REFER_WAV_PATH
-"""
+# Update the aux_ref_audio_paths to only include valid paths
+aux_ref_audio_paths = valid_aux_ref_audio_paths
 
 async def get_sovits_audio(text: str, ref_path: Optional[str] = None) -> Optional[str]:
     try:
-        async with httpx.AsyncClient(timeout=100.0, trust_env=False) as http_client:
-            # 使用传入的 ref_path（若存在），否则使用默认 REFER_WAV_PATH
-            if ref_path and os.path.exists(ref_path):
-                abs_refer_path = os.path.abspath(ref_path).replace("\\", "/")
-            else:
-                abs_refer_path = os.path.abspath(REFER_WAV_PATH).replace("\\", "/")
+        target_ref = to_api_path(ref_path) if ref_path else REFER_WAV_PATH
+        # 物理检查：如果文件真的不在，直接拦截并报错
+        if not os.path.exists(target_ref):
+            logger.error(f"❌ 物理路径不存在，请检查文件: {target_ref}")
+            return None
 
+        async with httpx.AsyncClient(timeout=160.0, trust_env=False) as http_client:
+            abs_refer_path = os.path.abspath(ref_path).replace("\\", "/") if ref_path else ""
             params = {
                 "text": text,
                 "text_lang": "zh",
-                # 只传主参考音频，忽略 aux 列表以满足要求
-                "ref_audio_path": abs_refer_path,
-                "aux_ref_audio_paths": aux_ref_audio_paths,  # 可选：提供辅助参考音频路径列表
+                "ref_audio_path": target_ref,
+                # "aux_ref_audio_paths": aux_ref_audio_paths,
                 "prompt_text": PROMPT_TEXT,
                 "prompt_lang": PROMPT_LANG,
                 "top_k": 5,
                 "top_p": 0.95,
                 "temperature": 0.9,
                 "text_split_method": "cut5",
-                "batch_size": 50,
+                "batch_size": 30,
                 "seed": -1,
-                "speed_factor": 1.1,
+                # "speed_factor": 1.1,
                 "parallel_infer": True,
                 "Repetition_Penalty": 1.4,
-                "sample_steps": 128,
+                "sample_steps": 64,
                 "fragment_interval": 0.3
             }
-            # 使用 POST 以确保 body 中包含所有字段（有时 GET 参数可能被截断）
-            r = await http_client.post(SOVITS_API_URL,timeout=120.0, json=params, headers={"Content-Type": "application/json"})
+            r = await http_client.post(SOVITS_API_URL, timeout=120.0, json=params, headers={"Content-Type": "application/json"})
             if r.status_code == 200:
                 return base64.b64encode(r.content).decode("utf-8")
             logger.error("SOVITS API error %s - %s", r.status_code, r.text)
-    except Exception:
-        logger.exception("语音合成异常")
+    except Exception as e:
+        logger.exception(f"Voice synthesis exception: {e}")
     return None
 
 
@@ -329,21 +295,18 @@ async def handle_chat(bot:Bot,event: GroupMessageEvent):
             reply_mode = 1
         else:
             # 冷却时间判定
-            last_time = last_reply_time.get(group_id, 0)
-            if current_time - last_time < GLOBAL_CD:
-                return
-            rand = random.random()
-            if rand < VOICE_PROBABILITY:
-                reply_mode = 2
-            elif rand < (VOICE_PROBABILITY + TEXT_PROBABILITY):
-                reply_mode = 1
-            else:
-                return
+            if not is_cooldown_active(group_id, current_time):
+                last_reply_time[group_id] = current_time
+                rand = random.random()
+                if rand < VOICE_PROBABILITY:
+                    reply_mode = 2
+                elif rand < (VOICE_PROBABILITY + TEXT_PROBABILITY):
+                    reply_mode = 1
+                else:
+                    return
     # 若未命中“帕朵”关键词，则不回复
     if reply_mode is None:
         return
-
-    last_reply_time[group_id] = current_time
 
     # 3. 帕朵化消息组装
     history = load_target_history(HISTORY_FILE_PATH, TARGET_UID)
@@ -371,7 +334,7 @@ async def handle_chat(bot:Bot,event: GroupMessageEvent):
             model=MODEL_NAME,
             messages=messages,
             temperature=0.85,          # 保持较高的创造力
-            max_tokens=150,            # 限制回复长度，防止长篇大论导致 TTS 语音生成太慢
+            max_tokens=100,            # 限制回复长度，防止长篇大论导致 TTS 语音生成太慢
             frequency_penalty=0.3,     # 降低重复用词的概率 (0.1 ~ 1.0 即可)
             presence_penalty=0.7,      # 鼓励模型多聊点新东西 (0.1 ~ 1.0 即可)
             stop=["用户:", "User:"]    # 看到这些词立刻停止，防止机器人精分替别人说话
@@ -380,7 +343,7 @@ async def handle_chat(bot:Bot,event: GroupMessageEvent):
         full_reply = response.choices[0].message.content.strip()
         # 清洗括号动作描述，用于语音合成
         tts_text = re.sub(r'[\(\uff08\[\u3010].*?[\)\uff09\]\u3011]', '', full_reply).strip() or "喵！"
-
+      
         # 选择参考音频（根据合成文本与回复内容匹配关键词）
         # selected_ref = choose_ref_audio(tts_text + " " + full_reply)
 
@@ -397,9 +360,14 @@ async def handle_chat(bot:Bot,event: GroupMessageEvent):
             await mimic_chat.send(full_reply)
         elif reply_mode == 2:
             logger.info("🎯 触发语音回复！")
-            audio = await get_sovits_audio(tts_text, ref_path=abs_ref_path)  # 可选：传入选择的参考音频路径
+            start_time = time.perf_counter() # 使用高精度计时器
+            audio = await get_sovits_audio(tts_text, ref_path=REFER_WAV_PATH)  # 可选：传入选择的参考音频路径
             if audio:
                 await mimic_chat.send(MessageSegment.record(f"base64://{audio}"))
+                end_time = time.perf_counter()
+                duration = end_time - start_time
+                logger.info(f"语音合成耗时: {duration:.2f} 秒")
+                await mimic_chat.send(f"本次语音合成耗时：{duration:.2f} 秒")
             else:
                 logger.warning("语音合成失败，改为发送文本回复")
                 await mimic_chat.send(full_reply)
@@ -408,7 +376,7 @@ async def handle_chat(bot:Bot,event: GroupMessageEvent):
             await mimic_chat.send(full_reply)
             audio_ratio = 0.5  # 文本和语音的发送比例（可调整）
             if random.random() < audio_ratio:
-                audio = await get_sovits_audio(tts_text, ref_path=abs_refer_path)
+                audio = await get_sovits_audio(tts_text, ref_path=REFER_WAV_PATH)
                 if audio: await mimic_chat.send(MessageSegment.record(f"base64://{audio}"))
                 logger.info("同时发送了语音回复")
         elif reply_mode == 4:
